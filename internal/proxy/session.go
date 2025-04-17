@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -13,24 +14,44 @@ import (
 	"time"
 )
 
+// Session represents a captured user session
+type Session struct {
+	ID         string    `json:"id"`
+	Cookies    string    `json:"cookies"`
+	UserAgent  string    `json:"user_agent"`
+	IP         string    `json:"ip"`
+	LastActive time.Time `json:"last_active"`
+	Metadata   string    `json:"metadata"`
+}
+
 // SessionManager handles all session operations
 type SessionManager struct {
-	db   *sql.DB
-	lock sync.RWMutex
+	db     *sql.DB
+	mu     sync.RWMutex
+	logger *log.Logger
 }
 
 // NewSessionManager creates a new session manager instance
-func NewSessionManager(db *sql.DB) *SessionManager {
-	return &SessionManager{db: db}
+func NewSessionManager(db *sql.DB, logger *log.Logger) *SessionManager {
+	if logger == nil {
+		logger = log.Default()
+	}
+	return &SessionManager{
+		db:     db,
+		logger: logger,
+	}
 }
 
-// saveSessionToDB stores session in database (called from updateSession)
-func saveSessionToDB(session Session) error {
-	if db == nil {
+// Save stores a session in the database
+func (sm *SessionManager) Save(ctx context.Context, session Session) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.db == nil {
 		return errors.New("database not initialized")
 	}
 
-	_, err := db.Exec(`
+	_, err := sm.db.ExecContext(ctx, `
 		INSERT OR REPLACE INTO sessions 
 		(id, cookies, user_agent, ip, last_active, metadata) 
 		VALUES (?, ?, ?, ?, ?, ?)`,
@@ -38,67 +59,26 @@ func saveSessionToDB(session Session) error {
 		session.Cookies,
 		session.UserAgent,
 		session.IP,
-		session.LastActive.Format(time.RFC3339),
+		session.LastActive.Format(time.RFC3339Nano),
 		session.Metadata,
 	)
-	
+
 	if err != nil {
-		log.Printf("Failed to save session: %v", err)
-		return err
+		sm.logger.Printf("Failed to save session %s: %v", session.ID, err)
+		return fmt.Errorf("failed to save session: %w", err)
 	}
 	return nil
 }
 
-// getRealIP extracts the real IP from request considering proxies
-func getRealIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		return strings.Split(ip, ",")[0]
-	}
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
-}
+// GetByID retrieves a session by its ID
+func (sm *SessionManager) GetByID(ctx context.Context, id string) (Session, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
 
-// getAllSessions returns all captured sessions from database
-func getAllSessions() ([]Session, error) {
-	rows, err := db.Query(`
-		SELECT id, cookies, user_agent, ip, last_active, metadata 
-		FROM sessions ORDER BY last_active DESC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var sessions []Session
-	for rows.Next() {
-		var s Session
-		var lastActive string
-		err := rows.Scan(
-			&s.ID,
-			&s.Cookies,
-			&s.UserAgent,
-			&s.IP,
-			&lastActive,
-			&s.Metadata,
-		)
-		if err != nil {
-			return nil, err
-		}
-		
-		s.LastActive, _ = time.Parse(time.RFC3339, lastActive)
-		sessions = append(sessions, s)
-	}
-	return sessions, nil
-}
-
-// getSessionByID retrieves a specific session
-func getSessionByID(id string) (Session, error) {
 	var s Session
 	var lastActive string
-	
-	err := db.QueryRow(`
+
+	err := sm.db.QueryRowContext(ctx, `
 		SELECT id, cookies, user_agent, ip, last_active, metadata 
 		FROM sessions WHERE id = ?`, id).Scan(
 		&s.ID,
@@ -108,41 +88,103 @@ func getSessionByID(id string) (Session, error) {
 		&lastActive,
 		&s.Metadata,
 	)
-	
+
 	if err != nil {
-		return Session{}, err
+		if errors.Is(err, sql.ErrNoRows) {
+			return Session{}, fmt.Errorf("session not found")
+		}
+		return Session{}, fmt.Errorf("failed to get session: %w", err)
 	}
-	
-	s.LastActive, _ = time.Parse(time.RFC3339, lastActive)
+
+	s.LastActive, _ = time.Parse(time.RFC3339Nano, lastActive)
 	return s, nil
 }
 
-// cleanOldSessions removes sessions older than specified duration
-func cleanOldSessions(maxAge time.Duration) {
-	_, err := db.Exec(`
-		DELETE FROM sessions 
-		WHERE last_active < ?`,
-		time.Now().Add(-maxAge).Format(time.RFC3339),
-	)
-	
+// GetAll retrieves all sessions sorted by last activity
+func (sm *SessionManager) GetAll(ctx context.Context) ([]Session, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	rows, err := sm.db.QueryContext(ctx, `
+		SELECT id, cookies, user_agent, ip, last_active, metadata 
+		FROM sessions ORDER BY last_active DESC`)
 	if err != nil {
-		log.Printf("Failed to clean old sessions: %v", err)
+		return nil, fmt.Errorf("failed to query sessions: %w", err)
 	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var s Session
+		var lastActive string
+		if err := rows.Scan(
+			&s.ID,
+			&s.Cookies,
+			&s.UserAgent,
+			&s.IP,
+			&lastActive,
+			&s.Metadata,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan session: %w", err)
+		}
+
+		s.LastActive, _ = time.Parse(time.RFC3339Nano, lastActive)
+		sessions = append(sessions, s)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return sessions, nil
 }
 
-// sessionToJSON converts session to JSON for admin panel
-func sessionToJSON(s Session) ([]byte, error) {
+// CleanOld removes sessions older than the specified duration
+func (sm *SessionManager) CleanOld(ctx context.Context, maxAge time.Duration) (int64, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	res, err := sm.db.ExecContext(ctx, `
+		DELETE FROM sessions 
+		WHERE last_active < ?`,
+		time.Now().Add(-maxAge).Format(time.RFC3339Nano),
+	)
+
+	if err != nil {
+		sm.logger.Printf("Failed to clean old sessions: %v", err)
+		return 0, fmt.Errorf("failed to clean old sessions: %w", err)
+	}
+
+	count, _ := res.RowsAffected()
+	return count, nil
+}
+
+// GetClientIP extracts the client IP from a request, considering proxies
+func GetClientIP(r *http.Request) string {
+	forwarded := r.Header.Get("X-Forwarded-For")
+	if forwarded != "" {
+		return strings.Split(forwarded, ",")[0]
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		return realIP
+	}
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return ip
+}
+
+// ToJSON converts a session to pretty-printed JSON for the admin panel
+func (s Session) ToJSON() ([]byte, error) {
 	return json.MarshalIndent(struct {
 		ID         string `json:"id"`
 		UserAgent  string `json:"user_agent"`
 		IP         string `json:"ip"`
 		LastActive string `json:"last_active"`
-		Cookies    int    `json:"cookie_count"`
+		CookieCount int   `json:"cookie_count"`
 	}{
 		ID:         s.ID,
 		UserAgent:  s.UserAgent,
 		IP:         s.IP,
-		LastActive: s.LastActive.Format(time.RFC3339),
-		Cookies:    len(strings.Split(s.Cookies, ";")),
+		LastActive: s.LastActive.Format(time.RFC1123),
+		CookieCount: len(strings.Split(s.Cookies, ";")),
 	}, "", "  ")
 }
